@@ -1,0 +1,456 @@
+---
+title: "TENxAnalysisPackage Vignette"
+author: "Olena Yavorska"
+date: "`r Sys.Date()`"
+output:
+  BiocStyle::html_document2
+vignette: >
+  %\VignetteIndexEntry{TENxAnalysisPackage Vignette}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Introduction 
+
+This package has been developed to provide a simplified method for analysing the 
+**1.3 Million Brain Cells from E18 Mice** data set from 10xGenomics
+(<https://support.10xgenomics.com/single-cell-gene-expression/datasets/1.3.0/1M_neurons>). 
+
+As part of this package, we include multiple visualisation tools which can be 
+used to: 
+
+* evaluate the data set in terms of quality by checking for outliers or unusual
+  expression patterns
+* investigate the behaviour of genes and gene groups across the data set through 
+  incorporation of gene ontology (GO) annotations (see <http://www.geneontology.org/>)
+* compare gene expression profiles 
+* etc.
+
+This vignette will provide an introduction to some of the functions of the 
+package and illustrate how they can be used to query the data. 
+
+## 1.3 Million Brain Cells from E18 Mice
+
+The original data set from Cell Ranger contains:
+
+  * 1,306,127 unique **cells** with:
+      * A mouse identifier, there were two different E18 C57BL/6 mice used when 
+        creating this data set, from here we'll refer to them simply as A and 
+        B
+      * A library identifier, there are 133 libraries included in the data 
+        set:
+          * cells from mouse A were used to make 69 libraries (660,598 cells 
+            altogether)
+          * cells from mouse B were used to make 64 libraries (645,529 cells 
+            altogether)
+        The libraries contain roughly 10,000 cells each.
+      * A unique molecular identifier (UMI) which is unique to each cell such 
+        that each transcript can be associated with its parent cell. This 
+        contains not only the sequence used within the GEM to tag the cell, but 
+        also the library identifier. For example barcodes AAACCTGAGATAGGAG-1 and 
+        AAACCTGAGATAGGAG-75 are an example where the same sequence is used 
+        within two different GEMs but in different libraries. Although many 
+        sequences are specific to a given GEM, most are found in multiple GEMs 
+        with some sequences barcoding as many as 11 GEMs in the data set.
+  * 27,998 unique **genes** with:
+      * a HGNC name
+      * an EMSEMBL identifier
+    
+*Note: Through some filtering, we found that the gene names are not unique. Thus, the package warns whenever there is ambiguity regarding the gene in question and prompts the user to use the ENSEMBL id instead (which are unique).*
+
+Since the data is very large (and thus cannot be loaded and analysed in R in its
+"raw" state), we chose to initially use summaries of the full data set and then
+filter the cell number to be more manageable based on these summaries and other
+attributes. The most simple approach to do this was to simply group cells in 
+bins of a pre-defined size and use this data until the single cell counts were 
+required.
+
+*Note: The data set is described in more detail in the original project report accompanying this package. Some of the data objects included in the package are directly relevant to the analyses described in the report so as to make the pipeline reproducible without spending a large chunk of time on lengthy calculations.*
+
+# TenXSubset class
+
+Most of the functions within this package work with a `TenXSubset` object. This 
+is a convenient way to store, retrieve, and use the most important gene-count 
+information from the data set.
+
+The `TenXSubset` object contains 15 slots:
+
+* `geneCounts` : a `data.frame` containing the total gene transcript counts 
+      for each cell bin (genes as rows and bins as columns)
+* `geneExpressed` : a `data.frame` containing the total number of expressed 
+      genes for each cell bin (genes as rows and bins as columns)
+* `geneNames` : the HGNC names of the genes in the data set
+* `geneENSEMBL` : the ENSEMBL identifier of the genes in the data set
+* `cellCounts` : a `data.frame` containing summaries per cell, the number of 
+      transcripts (UMIs) belonging to that cell and the total number of genes
+      expressed in that cell
+* `cellMouse` : mouse the cell belongs to
+* `cellLib` : library the cell belongs to 
+* `cellGroup` : bin the cell belongs to
+* `cellN` : number of cells are included in this data set
+* `groupN` : number of groups are included in this data set
+* `libN` : number of libraries are included in this data set
+* `geneN` : number of genes are included in this data set
+* `cellIndex` : which cells (with reference to the original 1.3 million data 
+      set) are included in this data set
+* `geneIndex` : which genes (with reference to the original 1.3 million data 
+      set) are included in this data set
+* `groupSize` : the size of the bins used to summarize the data
+
+Given a `TenXSubset` object, each slot can be easily accessed using the slot 
+name, e.g. `geneCounts(TenXSubset_object)`. As well as the above, one can also 
+use the `cellCountsTrans()` and `cellCountsExpr()` functions to directly access
+the number of transcripts per cell and the number of expressed genes per cell.
+
+A sample `TenXSubset` object is included in the package data :
+
+```{r message = FALSE}
+library(TENxAnalysisPackage)
+library(corrplot)
+data("Test_TenXSubset")
+```
+
+This particular subset contains all of the genes but only 50,000 randomly chosen
+cells. One can see the structure of the data in the slots by using this sample
+set:
+
+```{r}
+# This data set used particularly big groups 
+groupSize(Test_TenXSubset)
+```
+
+```{r}
+# The transcript counts for the first 6 genes
+geneCounts(Test_TenXSubset)[1:6,]
+```
+
+```{r}
+# The transcript and expressed gene counts for the first few cells
+head(cellCounts(Test_TenXSubset))
+```
+
+In order to generate these types of subsets, one can use the (aptly named) 
+`generateSubset()` function. This requires a path to the original data set and 
+calculations can take a very long time if the number of cells required is large.
+We use the syntax proposed by Martin Morgan in the 
+**TenXGenomics** package (see <https://github.com/mtmorgan/TENxGenomics>) to not 
+only download and store the data but also access it in small chunks.
+
+```{r, eval = FALSE}
+# Taken from the TenXGenomics vignette
+# See https://github.com/mtmorgan/TENxGenomics
+
+library(BiocFileCache)
+bfc <- BiocFileCache()
+
+oneM <- paste0(
+    "https://s3-us-west-2.amazonaws.com/10x.files/",
+    "samples/cell/1M_neurons/",
+    "1M_neurons_filtered_gene_bc_matrices_h5.h5"
+)
+path <- bfcrpath(bfc, oneM)
+```
+
+The `TenXSubsetAll` data object included in the package was generated using this
+function:
+
+```{r, eval = FALSE}
+# Note that this can take up to 20 hours to compute.
+# Thus this summary has been included in the package as a starting point for the 
+# user.
+
+# We include all cells, and all genes from the original data set
+TenXSubsetAll <- generateSubset(cellIndex = 1:nrow(TenXse_colData),
+                                geneIndex = 1:nrow(TenXse_rowData),
+                                groupSize = 10000, 
+                                path)
+```
+
+```{r, echo = FALSE}
+load("C:/Users/Olena/Desktop/SingleCellAnalysis/Data to be added to package later/TenXSubsetAll")
+```
+
+*Note : Alternatively, one can simply download the "aggr-Gene/cell matrix HDF5 (filtered)"" file from the original source (<https://support.10xgenomics.com/single-cell-gene-expression/datasets/1.3.0/1M_neurons>) and instead set path to be the location of the file.*
+
+# Plotting gene and transcript counts
+
+Assuming that we have created a `TenXSubset` object with `groupSize` > 1, we 
+cannot look at the effect of each individual gene on each cell. But, we can 
+still learn a lot about the cells in general by using the summaries in 
+`cellCounts`.
+
+The `plotTenX()` function creates an easy interface to allow the user to look at
+the effects of **X**:
+
+* cell (`cellID`)
+* bin/group (`groupID`) 
+* library (`libID`)
+* mouse (`mouseID`)
+
+on **Y**:
+
+* number of transcripts (`transCounts`)
+* number of expressed genes (`geneCounts`)
+* average number of transcripts per expressed gene (`transCountsNorm`) i.e.
+  `transCounts/geneCounts` for each gene
+
+For example, below we can see how the library seems to impact the number of 
+expressed genes (and whether the mouse that the library has been prepared from
+has any notable effect).
+
+```{r}
+plotTenX(Test_TenXSubset, 
+         x = "libID", y = "geneCounts", 
+         type = "boxplot", 
+         colorByCells = "mouse", colorByGenes = NULL)
+```
+
+Thus, one can not only choose the variables to plot against each other but also
+how they should be coloured. See package documentation for a complete list of 
+allowed parameter combinations.
+
+Apart from the above, be can also run some "Y value" comparisons by checking the
+distribution of `geneCounts` against `transCounts` for example:
+
+```{r}
+plotTenX(Test_TenXSubset, 
+         x = "geneCounts", y = "transCounts", type = "facet", 
+         colorByCells = "mouse", colorByGenes = NULL)
+```
+
+If one would instead like to focus on genes rather than cells, the syntax is 
+very similar:
+
+```{r}
+plotTenX(Test_TenXSubset, 
+         x = "geneID", y = "transCounts", type = "bar", 
+         colorByCells = NULL, colorByGenes = NULL)
+```
+
+## Indexing and Subsetting
+
+While working with the data we realised that it's very important to be able to 
+transition between different types of indices. Thus, we included some indexing 
+functions which will hopefully simplify exploration of the data. These are named
+in a very systematic way:
+
+* `determineGeneID()` generates a logical vector giving the index of a 
+  user-specified gene in the data set (can be HGNC or ENSEMBL)
+* `determineMouseFromGroup()` gives the mouse (A or B) that this group was 
+  generated from
+* `determineSampleFromGroup()` gives the indices of the cells in a group
+* etc.
+
+For example, if we find that groups 34, 47, and 57 have an interesting 
+expression pattern, we can quickly discern that they all come from mouse A:
+
+```{r}
+determineMouseFromGroup(c(34, 47, 57), TenXSubsetAll)
+```
+
+# Plotting individual genes
+
+> Given a gene name, is this gene upregulated or downregulated in these cells? 
+
+> Is it expressed in all cells or a few select ones? 
+
+> How does the expression compare to other genes?
+
+The `plotTenXGene` function attempts to answer these questions by analysing 
+where the chosen gene lies with reference to the others in the data set.
+
+Below we see an overview of the Calm2 gene, and notice that:
+
+* Compared to the total transcript counts for all other genes (`Trans`), Calm2 
+  (shown in red) is one of the most expressed genes across the data set based on
+  its rank.
+* This gene is expressed in almost every cell in the data set (`Cells` shows the
+  number of cells expressing this gene).
+* It is expressed to a high degree in most cells (`NormTrans = Trans/Cells`).
+
+```{r, warning=FALSE}
+plotTenXGene(Test_TenXSubset, "Rbm3")
+```
+
+We can also look at how gene expression changes across groups (useful when 
+checking for outliers):
+
+```{r, warning=FALSE}
+plotTenXGroupExpr(Test_TenXSubset, "Rbm3")
+```
+
+# Gene Ontology Analyses
+
+Since we are dealing with a large group of genes, it is useful to be able to 
+annotate them somehow based on their function. In order to understand:
+
+* which functions are the most represented in the data?
+* where the "expected" functions lie compared to the rest?
+* where do brain development-related genes lie compared to other types in terms 
+  of abundance?
+
+To answer the above, we developed some GO specific functions which can be used 
+with our `TenXSubset` objects. 
+
+## Determining gene/cluster function
+
+Suppose you've found a group of genes which have caught your interest:
+
+* they vary across cells in some systematic way, implying relationship with cell 
+  type
+* they vary between mice, implying they may be individual-specific
+* they have an unusually high/low expression pattern across the data set, so
+  maybe they are members of the core set of genes
+
+Given the names of these genes (HGNC or ENSEMBL), we can use `plotTenXGeneGO()`
+to show the top 10 most abundant GO terms in this group of genes.
+
+*Note: Recall that each gene is associated with multiple GO terms, thus GO terms across different genes can overlap highly or not at all. This function allows you to determine the top overlapping terms, and thus those that this gene set is best classified by.*
+
+In this way you can also determine the most "important" functions in the subset
+by looking at the most expressed genes:
+
+```{r, warning=FALSE}
+# Genes with over 500k transcripts across all cells
+plotTenXGeneGO(Test_TenXSubset, 
+               geneName = geneNames(Test_TenXSubset)[
+                 which(rowSums(geneCounts(Test_TenXSubset)) > 500000)])
+```
+
+This type of analysis can work both ways using the functions:
+
+* `determineGeneFromGO()`
+* `determineGeneFromQuery()`
+* `determineGOFromGene()`
+
+Thus we can easily find genes associated with a specific GO term (or those with 
+a certain phrase/query in the description), allowing us to subset the TenX 
+object accordingly. Similarly, given a set of genes that have an interesting 
+expression profile, we can work backwards to find if there is any overlap in the
+functions these genes are expected to carry out.
+
+## How frequently expressed are certain GO terms/Queries?
+
+Supposing you have a function that you are interested in, where do genes which
+are associated with this function (according to the GO database) fall compared 
+to the rest in terms of transcript counts and the number of cells that express
+them?
+
+This can be answered using the `plotTenXGO()` function which looks at the entire
+subset as well as the chosen function (GO term) and shows how the relevant genes
+rank within the entire data set (similarly to `plotTenXGene`). The relevant 
+genes and ranks are also returned in case further processing is required.
+
+Below we see that most of the genes with the highest expression are not directly
+associated with brain development (bar Stmn1), but this group of genes does tend
+to be expressed across a large number of cells (which is expected since the GO
+term is quite broad).
+
+```{r, warning=FALSE}
+temp <- plotTenXGO(TenXSubsetAll, "brain development")
+head(temp)
+```
+
+Alternatively we can look at much more specific GO terms:
+
+```{r, warning=FALSE}
+plotTenXGO(TenXSubsetAll, "ventricular system development")
+```
+
+## Are genes related?
+
+An easy way to check if a group of genes is likely to be related is to check for
+similarities in the expression profiles. For example, below we compare genes 
+related to oligodendrocyte development.
+
+```{r, warning=FALSE}
+plotTenXGeneCor(
+  TenXSubsetAll, 
+  as.vector(determineGeneFromQuery("oligodendrocyte development")$Symbol))
+```
+
+We can then use this information to not only find interesting gene associations, 
+but also unexpected expression patterns. Note that, depending on the groupSize 
+used when generating the TenXSubset object, this type of analysis can be very 
+misleading since summaries can be similar by chance. Hence, it is useful to then 
+look at the individual comparisons in more detail within TenXSubset's that have
+smaller groups.
+
+This, when we looked at the group of genes in the left corner we found that 
+these expression profiles showed bimodal distributions.
+
+```{r, warning=FALSE}
+plotTenXGenePair(TenXSubsetAll, "Hes5", "Cd9")
+```
+
+Upon further investigation of the individual profiles it appears that the 
+expression is mouse related.
+
+```{r, warning=FALSE}
+plotTenXGroupExpr(TenXSubsetAll, "Hes5")
+```
+
+To check if this is indeed the case (and not an artefact of summarizing) we can 
+choose a random set of cells and compare the expression across mice by ensuring 
+that *groupSize* is 1
+
+```{r, eval=FALSE}
+mouseTenXSubset <- generateSubset(sample(1:nrow(TenXse_colData), 1000), 
+                                  which(TenXse_rowData$Symbol %in% 
+                                          c("Ascl1", "Hes5", "Cd9")),
+                                  1, 
+                                  path)
+
+mouseSummary <- generateSummaryExpr(mouseTenXSubset)
+
+plotTenXMouseExpr(mouseSummary, c("Ascl1", "Hes5", "Cd9"), "all")
+```
+
+# Expression Variability
+
+We pre-calculated the mean, variance, and coefficient of variation for each gene
+within each library (as well as across the data set), these can be found under 
+`meandDF`, `varDF`, and `cvDF`. Within the original manuscript, these were used 
+to evaluate library variability as follows:
+
+```{r}
+meanDF[1:5, 1:8]
+```
+
+```{r, warning=FALSE}
+# Create a new data frame to hold the summaries
+meanDFvariability <- meanDF[,1:4]
+
+# Mean library expression per mouse
+meanDFvariability$meanA <- rowMeans(as.matrix(meanDF[,(1:69) + 4]))
+meanDFvariability$meanB <- rowMeans(as.matrix(meanDF[,(1:64) + 73]))
+
+# Mean library variance per mouse
+meanDFvariability$varA <- rowMeans(as.matrix(varDF[,(1:69) + 4]))
+meanDFvariability$varB <- rowMeans(as.matrix(varDF[,(1:64) + 73]))
+
+# Variability of mean expression
+meanDFvariability$variation <- rowVars(as.matrix(meanDF[,-c(1:4)]))
+meanDFvariability$variationA <- rowVars(as.matrix(meanDF[,(1:69) + 4]))
+meanDFvariability$variationB <- rowVars(as.matrix(meanDF[,(1:64) + 73]))
+
+# Variability of expression variance
+meanDFvariability$variationAvars <- rowVars(as.matrix(varDF[,(1:69) + 4]))
+meanDFvariability$variationBvars <- rowVars(as.matrix(varDF[,(1:64) + 73]))
+
+# Compare mean variability in A against B, color genes by mean expression
+ggplot(meanDFvariability, 
+       aes(x = variationB, y = variationA, color = allLib)) +
+  geom_point(alpha = 0.1, size = 0.5) +
+  geom_abline(slope = 1, color = "#007F9F", size = 0.5) +
+  theme_classic() +
+  xlab(expression(log[10](mu[sigma[g]^B]))) +
+  ylab(expression(log[10](mu[sigma[g]^A]))) +
+  scale_x_continuous(trans = "log10") +
+  scale_y_continuous(trans = "log10") +
+  scale_color_gradient(expression(log[10](mu[g])), 
+                       low = "red", high = "green", trans = "log10") +
+  theme(legend.position = "none")
+```
+
+Clearly there are many other ways in which the 3 data sets can be used.
